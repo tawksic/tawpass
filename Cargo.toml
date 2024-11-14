@@ -5,3 +5,4 @@ edition = "2021"
 
 [dependencies]
 termios = "0.3"
+hex = "0.4"
