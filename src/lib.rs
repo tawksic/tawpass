@@ -1,7 +1,10 @@
 extern crate termios;
 extern crate hex;
+extern crate serde;
 
 use termios::{Termios, tcsetattr, ECHO, TCSANOW};
+use serde::{Serialize, Deserialize};
+use base64::{encode, decode};
 use std::fs::OpenOptions;
 use std::io::{self, Read, Write, stdin};
 use std::os::unix::io::AsRawFd;
@@ -9,6 +12,35 @@ use std::os::unix::io::AsRawFd;
 pub struct Config {
     pub command: String,
     pub param: String,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+pub struct Passwords {
+    entries: Vec<Entry>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Entry {
+    pub param: String,
+    
+    #[serde(serialize_with = "serialize_base64", deserialize_with = "deserialize_base64")]
+    pub password: Vec<u8>,
+}
+
+fn serialize_base64<S>(bytes: &Vec<u8>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    let encoded = encode(bytes); // Convert to Base64 string
+    serializer.serialize_str(&encoded)
+}
+
+fn deserialize_base64<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    decode(&s).map_err(serde::de::Error::custom) // Decode from Base64 string to Vec<u8>
 }
 
 pub fn initialize_key() -> io::Result<Vec<u8>> {
@@ -62,12 +94,8 @@ fn manipulate_echo(action: bool) {
 }
 
 pub fn add_password(param: &String, key_buffer: &[u8]) {
-    let mut pass_file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .append(true)
-        .open("passwords.json")
-        .expect("Failed to open passwords.json");
+    // Open or create passwords.json and read existing data
+    let mut passwords = load_passwords().unwrap_or_default();
 
     println!("Enter your password: ");
     manipulate_echo(true);
@@ -80,39 +108,45 @@ pub fn add_password(param: &String, key_buffer: &[u8]) {
 
     let pw = pw.trim_end().as_bytes();
 
-    let encrypted_pw: Vec<u8> = pw.iter()
+    // Encrypt the password
+    let encrypted_pw: Vec<u8> = pw
+        .iter()
         .zip(key_buffer.iter().cycle()) 
         .map(|(p_byte, k_byte)| p_byte ^ k_byte)
         .collect();
 
-    let encrypted_pw_hex = hex::encode(&encrypted_pw);
+    // Add new entry to the list
+    passwords.entries.push(Entry {
+        param: param.clone(),
+        password: encrypted_pw,
+    });
 
-    pass_file.write_all(format!("{}: {}\n", param, encrypted_pw_hex).as_bytes())
-        .expect("Failed to write to pass_file");
+    // Serialize and write back to passwords.json
+    let serialized = serde_json::to_string_pretty(&passwords).expect("Failed to serialize passwords");
+    std::fs::write("passwords.json", serialized).expect("Failed to write to passwords.json");
+}
+
+fn load_passwords() -> io::Result<Passwords> {
+    let file = std::fs::File::open("passwords.json");
+    match file {
+        Ok(file) => serde_json::from_reader(file).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e)),
+        Err(_) => Ok(Passwords::default()), // Return an empty Passwords struct if the file doesn't exist
+    }
 }
 
 pub fn print_passwords(key_buffer: &[u8]) {
-    let mut pass_file = OpenOptions::new()
-        .read(true)
-        .open("passwords.json")
-        .expect("Failed to open passwords.json");
+    let passwords = load_passwords().expect("Failed to load passwords");
 
-    let mut secrets_buffer = String::new();
-    pass_file.read_to_string(&mut secrets_buffer).expect("Failed to read pass_file");
+    for entry in passwords.entries {
+        // Decrypt each password
+        let decrypted_bytes: Vec<u8> = entry.password
+            .iter()
+            .zip(key_buffer.iter().cycle())
+            .map(|(enc_byte, key_byte)| enc_byte ^ key_byte)
+            .collect();
 
-    for line in secrets_buffer.lines() {
-        if let Some((param, encrypted_data)) = line.split_once(": ") {
-            let encrypted_bytes = hex::decode(encrypted_data).expect("Failed to decode encrypted data");
+        let decrypted_password = String::from_utf8(decrypted_bytes).expect("Failed to decode decrypted password");
 
-            let decrypted_bytes: Vec<u8> = encrypted_bytes
-                .iter()
-                .zip(key_buffer.iter().cycle())
-                .map(|(enc_byte, key_byte)| enc_byte ^ key_byte)
-                .collect();
-
-            let decrypted_password = String::from_utf8(decrypted_bytes).expect("Failed to decode decrypted password");
-
-            println!("{}: {}", param, decrypted_password);
-        }
+        println!("{}: {}", entry.param, decrypted_password);
     }
 }
